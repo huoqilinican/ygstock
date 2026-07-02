@@ -1,0 +1,215 @@
+在 PHP 中实现高并发下的库存扣减，核心问题是防止超卖（即扣减数量超过实际库存）。由于 PHP 本身不支持多线程，高并发场景下的竞争条件主要发生在数据库层面。
+
+下面按解决方案的可靠性从低到高，介绍几种常见方法：
+
+1. 避免 PHP 层面的直接扣减（最不可靠）
+
+// 错误示例：先查后扣
+$stock = $db->query("SELECT stock FROM goods WHERE id=1")->fetch();
+if ($stock['stock'] >= $quantity) {
+    $db->query("UPDATE goods SET stock = stock - $quantity WHERE id=1");
+}
+
+问题：两个并发请求同时查询，都看到库存充足，都执行更新，导致超卖。
+
+
+
+
+
+
+
+2. 使用 MySQL 行锁 + 事务（可靠，性能中等）
+
+利用 SELECT ... FOR UPDATE 锁定被更新的行，直到事务结束。
+
+$db->beginTransaction();
+try {
+    // 加行锁（需要 InnoDB 引擎，且查询条件命中索引）
+    $stmt = $db->prepare("SELECT stock FROM goods WHERE id = ? FOR UPDATE");
+    $stmt->execute([$goodsId]);
+    $stock = $stmt->fetchColumn();
+    
+    if ($stock >= $quantity) {
+        $update = $db->prepare("UPDATE goods SET stock = stock - ? WHERE id = ?");
+        $update->execute([$quantity, $goodsId]);
+        $db->commit();
+        return true;
+    } else {
+        $db->rollBack();
+        return false;
+    }
+} catch (Exception $e) {
+    $db->rollBack();
+    throw $e;
+}
+
+优点：100% 防止超卖，利用数据库 ACID。
+
+缺点：并发高时排队严重，吞吐量下降。
+
+
+
+
+
+
+
+
+
+3. 乐观锁（版本号机制）
+
+不锁定行，更新时检查库存是否被改动过。
+
+// 表结构增加 version 字段
+// ALTER TABLE goods ADD COLUMN version INT DEFAULT 0;
+
+$retry = 3;
+while ($retry-- > 0) {
+    // 查询当前库存和版本号
+    $row = $db->query("SELECT stock, version FROM goods WHERE id=$goodsId")->fetch();
+    if ($row['stock'] < $quantity) return false;
+    
+    $newStock = $row['stock'] - $quantity;
+    $newVersion = $row['version'] + 1;
+    
+    // 更新时检查版本号是否一致
+    $affected = $db->exec("UPDATE goods SET stock=$newStock, version=$newVersion 
+                           WHERE id=$goodsId AND version={$row['version']}");
+    if ($affected) {
+        return true;
+    }
+    // 版本冲突，重试
+}
+return false;
+
+优点：不锁行，并发度高。
+
+缺点：冲突频繁时需要重试，CPU 开销增加。
+
+
+
+
+
+
+
+
+
+
+4. 原子更新（无事务，最高性能）
+
+利用 MySQL 的原子性，一条 SQL 完成条件判断和扣减。
+
+$sql = "UPDATE goods SET stock = stock - $quantity 
+        WHERE id = $goodsId AND stock >= $quantity";
+$affected = $db->exec($sql);
+if ($affected) {
+    return true; // 扣减成功
+}
+return false; // 库存不足或更新失败
+
+
+原理：UPDATE 中的 WHERE stock >= quantity 和 SET stock = stock - quantity 在同一语句中执行，不会被其它 SQL 干扰。
+
+优点：性能极高，无锁等待，无事务开销。
+
+缺点：无法获取扣减前的原始库存值（如果需要记录扣减明细，需配合 SELECT ... UPDATE）。
+
+这是生产环境中最常用的高并发扣减方式。
+
+
+
+
+
+
+
+
+
+
+
+
+5. Redis 预扣减 + 异步同步（超高并发）
+适用于秒杀、抢购等极端高并发场景，将库存放在内存中操作。
+
+$redis = new Redis();
+$redis->connect('127.0.0.1', 6379);
+
+$key = "goods:{$goodsId}:stock";
+$lua = <<<LUA
+local stock = redis.call('get', KEYS[1])
+if not stock then return -1 end
+if tonumber(stock) >= tonumber(ARGV[1]) then
+    redis.call('decrby', KEYS[1], ARGV[1])
+    return 1
+else
+    return 0
+end
+LUA;
+
+$result = $redis->eval($lua, [$key, $quantity], 1);
+if ($result == 1) {
+    // 扣减成功，将订单信息推入消息队列，由后台进程异步处理
+    $queue->push(['goods_id' => $goodsId, 'quantity' => $quantity, 'user_id' => $userId]);
+    return true;
+} elseif ($result == 0) {
+    return false; // 库存不足
+} else {
+    // 缓存未命中，回退到数据库
+}
+
+优点：单机 Redis 每秒数万 QPS，集群更高。
+
+缺点：
+
+Redis 数据可能丢失（需配合持久化）。
+
+需处理缓存与数据库的一致性问题（如最终一致性方案）。
+
+增加系统复杂度。
+
+
+
+
+
+
+
+
+
+
+
+
+
+方案选型总结
+
+方案	                    是否超卖             适用并发量	     推荐场景                 实现复杂度	                        	                        
+行锁 + 事务	             否                   低~中	        普通电商下单（< 500 QPS）      低         	                              	                       
+乐观锁	                 否	                   中             冲突不频繁的更新场景          中     	                                                     
+原子 UPDATE	             否                   中~高	     大多数业务首选（1000~5000QPS）    最低        	                              	                       
+Redis 预扣减	            几乎否                 极高	          秒杀、抢票（> 1w QPS）        高      	                            	                    
+
+
+
+
+生产级建议
+
+1.默认使用原子 UPDATE：简单可靠，90% 的场景够用。
+
+2.配合唯一索引防止重复扣减：在订单表中对 (user_id, goods_id, activity_id) 建立唯一索引，避免同一用户重复下单。
+
+3.记录扣减流水：在更新库存的同时，插入一条库存变更记录，方便对账和回溯。
+
+4. 使用 Redis 时：务必设计兜底方案（如扣减失败后从数据库恢复），避免缓存失效导致超卖。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

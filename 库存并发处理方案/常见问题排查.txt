@@ -1,0 +1,58 @@
+1.死锁问题排查
+
+-- 查看当前事务和锁信息
+SHOW ENGINE INNODB STATUS\G
+
+-- 查看正在锁的事务
+SELECT * FROM information_schema.INNODB_LOCKS;
+
+-- 查看等待锁的事务
+SELECT * FROM information_schema.INNODB_LOCK_WAITS;
+
+-- 杀掉阻塞的进程
+KILL [PROCESS_ID];
+
+
+
+
+2.性能瓶颈分析
+
+// 添加性能监控
+$startTime = microtime(true);
+
+// 业务代码...
+
+$endTime = microtime(true);
+$cost = ($endTime - $startTime) * 1000;
+
+if ($cost > 100) {
+    Log::warning("接口超时", ['cost' => $cost, 'url' => request()->url()]);
+}
+
+
+
+3.数据一致性验证
+
+-- 每天执行对账脚本
+SELECT 
+    g.id,
+    g.stock as db_stock,
+    (SELECT SUM(num) FROM orders WHERE goods_id = g.id AND status IN (0,1)) as sold_count,
+    g.init_stock - g.stock as should_sold
+FROM goods g
+WHERE g.init_stock - g.stock != (SELECT SUM(num) FROM orders WHERE goods_id = g.id);
+
+
+
+
+总结
+
+优先使用原子更新：90%的场景够用，简单可靠
+
+复杂业务用悲观锁：但要控制事务范围
+
+跨服务用分布式锁：注意处理锁失效和续期
+
+高并发秒杀用Redis+队列：先返回成功，异步落库
+
+核心原则：能不加锁就不加锁，加锁范围越小越好，锁持有时间越短越好。

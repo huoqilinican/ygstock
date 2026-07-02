@@ -1,0 +1,313 @@
+数据库原子更新
+
+1 为什么一条UPDATE语句能解决并发？
+
+-- 这条语句在数据库层面是原子的
+UPDATE goods 
+SET stock = stock - 1 
+WHERE id = 1 AND stock >= 1;
+
+数据库内部执行流程：
+
+1. MySQL服务器收到UPDATE语句
+2. 根据id=1找到对应的数据行（InnoDB引擎）
+3. 给该行加上行锁（X锁，排他锁）
+4. 读取当前stock值（假设为5）
+5. 检查WHERE条件：5 >= 1 → 通过
+6. 计算新值：5 - 1 = 4
+7. 写入新值4到该行
+8. 释放行锁
+9. 返回受影响行数：1
+
+
+关键点：步骤3-8是在同一个锁保护下连续执行的，不会有其他事务插进来读取或修改这一行。
+
+
+
+2 行锁的排队机制
+
+// 假设100个请求同时执行这段代码
+Db::name('goods')
+    ->where('id', 1)
+    ->where('stock', '>=', 1)
+    ->update(['stock' => Db::raw('stock - 1')]);
+
+
+数据库实际执行顺序（微观视角）：
+
+    时刻   操作
+0ms  请求1：获取行锁成功，开始执行
+0ms  请求2-100：等待行锁（阻塞状态）
+5ms  请求1：执行完成，释放锁，返回affected=1
+5ms  请求2：获取行锁成功，开始执行
+5ms  请求3-100：继续等待
+10ms 请求2：stock已是0，WHERE条件失败，返回affected=0
+10ms 请求3：获取锁，执行...
+...
+
+
+结论：即使10000个并发请求，数据库也能保证库存不会扣到负数。
+
+
+
+
+
+
+3 完整的下单流程代码
+
+<?php
+namespace app\controller;
+
+use app\BaseController;
+use think\facade\Db;
+use think\facade\Log;
+use think\facade\Validate;
+
+class Order extends BaseController
+{
+    /**
+     * 下单接口（完整版）
+     * @route POST /api/order/create
+     * 
+     * 请求参数：
+     * - goods_id: 商品ID
+     * - num: 购买数量
+     * - user_id: 用户ID（实际应从token获取）
+     */
+    public function create()
+    {
+        // 1. 接收参数
+        $params = $this->request->post();
+        
+        // 2. 参数校验
+        $validate = Validate::rule([
+            'goods_id' => 'require|integer|>0',
+            'num' => 'require|integer|>0|<=10',  // 单次最多10件
+            'user_id' => 'require|integer|>0'
+        ]);
+        
+        if (!$validate->check($params)) {
+            return json([
+                'code' => 400,
+                'msg' => $validate->getError()
+            ]);
+        }
+        
+        $goodsId = $params['goods_id'];
+        $buyNum = $params['num'];
+        $userId = $params['user_id'];
+        
+        // 3. 开启事务
+        Db::startTrans();
+        
+        try {
+            // 4. 第一步：原子扣库存（前置拦截）
+            $affected = Db::name('goods')
+                ->where('id', $goodsId)
+                ->where('stock', '>=', $buyNum)      // 库存充足才更新
+                ->where('status', 1)                  // 商品上架状态
+                ->where('delete_time', null)          // 未删除
+                ->update([
+                    'stock' => Db::raw('stock - ' . $buyNum),
+                    'sales' => Db::raw('sales + ' . $buyNum),  // 销量累加
+                    'update_time' => time()
+                ]);
+            
+            // 5. 库存不足处理
+            if ($affected === 0) {
+                // 重新查询一次，获取详细原因（便于给用户友好提示）
+                $goods = Db::name('goods')
+                    ->field('stock, status')
+                    ->where('id', $goodsId)
+                    ->find();
+                
+                if (!$goods) {
+                    throw new \Exception('商品不存在');
+                }
+                if ($goods['status'] != 1) {
+                    throw new \Exception('商品已下架');
+                }
+                if ($goods['stock'] < $buyNum) {
+                    throw new \Exception('库存不足，当前剩余：' . $goods['stock']);
+                }
+                throw new \Exception('下单失败');
+            }
+            
+            // 6. 第二步：生成订单号（唯一且有序）
+            $orderSn = $this->generateOrderSn();
+            
+            // 7. 第三步：创建订单记录
+            $orderData = [
+                'order_sn' => $orderSn,
+                'goods_id' => $goodsId,
+                'user_id' => $userId,
+                'num' => $buyNum,
+                'amount' => $this->getGoodsPrice($goodsId) * $buyNum, // 总金额
+                'status' => 0,          // 0:待支付 1:已支付 2:已发货 3:已完成 4:已取消
+                'create_time' => time(),
+                'expire_time' => time() + 1800  // 30分钟未支付自动取消
+            ];
+            
+            $orderId = Db::name('orders')->insertGetId($orderData);
+            
+            // 8. 第四步：记录库存流水（便于对账和回溯）
+            Db::name('stock_log')->insert([
+                'goods_id' => $goodsId,
+                'order_id' => $orderId,
+                'change_type' => 1,     // 1:下单扣减 2:取消退回 3:管理员调整
+                'change_num' => -$buyNum,
+                'before_stock' => $goods['stock'] ?? 0,
+                'after_stock' => $goods['stock'] - $buyNum,
+                'operator' => $userId,
+                'create_time' => time()
+            ]);
+            
+            // 9. 提交事务
+            Db::commit();
+            
+            // 10. 记录成功日志
+            Log::info("下单成功", [
+                'order_sn' => $orderSn,
+                'user_id' => $userId,
+                'goods_id' => $goodsId,
+                'num' => $buyNum
+            ]);
+            
+            return json([
+                'code' => 0,
+                'msg' => '下单成功，请尽快支付',
+                'data' => [
+                    'order_id' => $orderId,
+                    'order_sn' => $orderSn,
+                    'expire_time' => date('Y-m-d H:i:s', $orderData['expire_time'])
+                ]
+            ]);
+            
+        } catch (\Exception $e) {
+            // 回滚事务
+            Db::rollback();
+            
+            // 记录错误日志
+            Log::error("下单失败", [
+                'error' => $e->getMessage(),
+                'params' => $params,
+                'trace' => $e->getTraceAsString()
+            ]);
+            
+            return json([
+                'code' => 500,
+                'msg' => $e->getMessage()
+            ]);
+        }
+    }
+    
+    /**
+     * 生成订单号
+     * 规则：年月日时分秒 + 微秒 + 随机数
+     * 例：2023120112000012345601
+     */
+    private function generateOrderSn()
+    {
+        // 获取微秒时间
+        list($usec, $sec) = explode(' ', microtime());
+        $msec = round($usec * 10000);
+        
+        return date('YmdHis') . $msec . mt_rand(100, 999);
+    }
+    
+    /**
+     * 获取商品价格（实际应从缓存或数据库获取）
+     */
+    private function getGoodsPrice($goodsId)
+    {
+        $price = Db::name('goods')->where('id', $goodsId)->value('price');
+        return $price ?: 0;
+    }
+}
+
+
+
+
+
+4 数据库表结构设计（支持高并发）
+
+-- 商品表（优化查询和更新性能）
+CREATE TABLE `goods` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `name` varchar(255) NOT NULL COMMENT '商品名称',
+  `price` decimal(10,2) NOT NULL DEFAULT '0.00' COMMENT '价格',
+  `stock` int(11) UNSIGNED NOT NULL DEFAULT '0' COMMENT '库存（无符号，自动防负数）',
+  `sales` int(11) NOT NULL DEFAULT '0' COMMENT '销量',
+  `status` tinyint(1) NOT NULL DEFAULT '1' COMMENT '状态 1上架 0下架',
+  `version` int(11) NOT NULL DEFAULT '0' COMMENT '乐观锁版本号（备用）',
+  `create_time` int(11) NOT NULL COMMENT '创建时间',
+  `update_time` int(11) NOT NULL COMMENT '更新时间',
+  `delete_time` int(11) DEFAULT NULL COMMENT '软删除时间',
+  PRIMARY KEY (`id`),
+  KEY `idx_status_stock` (`status`, `stock`)  -- 复合索引，加速WHERE条件过滤
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品表';
+
+-- 订单表
+CREATE TABLE `orders` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `order_sn` varchar(32) NOT NULL COMMENT '订单号',
+  `goods_id` int(11) NOT NULL COMMENT '商品ID',
+  `user_id` int(11) NOT NULL COMMENT '用户ID',
+  `num` int(11) NOT NULL COMMENT '数量',
+  `amount` decimal(10,2) NOT NULL COMMENT '总金额',
+  `status` tinyint(1) NOT NULL DEFAULT '0' COMMENT '0待支付 1已支付 2已发货 3已完成 4已取消',
+  `create_time` int(11) NOT NULL,
+  `pay_time` int(11) DEFAULT NULL,
+  `expire_time` int(11) NOT NULL COMMENT '订单过期时间',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_order_sn` (`order_sn`),
+  KEY `idx_user_id` (`user_id`),
+  KEY `idx_status_expire` (`status`, `expire_time`)  -- 用于定时任务扫描过期订单
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单表';
+
+-- 库存流水表（对账用）
+CREATE TABLE `stock_log` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `goods_id` int(11) NOT NULL,
+  `order_id` int(11) DEFAULT NULL,
+  `change_type` tinyint(1) NOT NULL COMMENT '1下单扣减 2取消退回 3管理员调整',
+  `change_num` int(11) NOT NULL COMMENT '变动数量（负数为扣减）',
+  `before_stock` int(11) NOT NULL,
+  `after_stock` int(11) NOT NULL,
+  `operator` varchar(100) DEFAULT NULL,
+  `create_time` int(11) NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_goods_id` (`goods_id`),
+  KEY `idx_order_id` (`order_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='库存流水表';
+
+
+
+
+
+5 方案的优缺点
+优点：
+
+✅ 实现简单，代码量少
+
+✅ 性能好，不需要额外组件
+
+✅ 强一致性，不会有超卖
+
+✅ 支持ACID事务，订单和库存同步
+
+缺点：
+
+❌ 数据库压力大（TPS受限）
+
+❌ 不适合极高并发（>5000 TPS）
+
+❌ 长事务会导致锁等待超时
+
+适用场景：
+
+普通电商网站
+
+日均订单<1万
+
+单商品QPS<500

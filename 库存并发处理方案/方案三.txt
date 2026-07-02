@@ -1,0 +1,409 @@
+Redis分布式锁
+
+1 分布式锁的核心原理
+问题：PHP应用部署在多台服务器上，数据库锁失效（不同服务器的事务互相隔离）
+
+解决：使用一个所有服务器都能访问的中间件（Redis）来实现全局锁
+
+核心要求：
+
+互斥性：同一时刻只有一个客户端能获得锁
+
+防死锁：锁必须有过期时间
+
+锁标识：只能自己解自己的锁（防误删）
+
+高可用：Redis主从或集群
+
+
+
+
+2 分布式锁的完整实现
+
+<?php
+namespace app\service;
+
+use think\facade\Cache;
+use think\facade\Log;
+
+class RedisLock
+{
+    private $redis;
+    
+    public function __construct()
+    {
+        $this->redis = Cache::store('redis')->getRedis();
+    }
+    
+
+
+    /**
+     * 获取锁（非阻塞模式）
+     * @param string $key
+     * @param string $token
+     * @param int $ttl
+     * @return bool
+     */
+    public function lockNonBlocking($key, $token, $ttl = 10)
+    {
+        $result = $this->redis->set($key, $token, ['nx', 'ex' => $ttl]);
+        return $result === true;
+    }
+
+
+
+    /**
+     * 获取锁（阻塞模式）
+     * @param string $key 锁的键名
+     * @param string $token 唯一标识（用uniquid生成）
+     * @param int $ttl 锁的过期时间（秒）
+     * @param int $timeout 获取锁的超时时间（毫秒）
+     * @return bool
+     */
+    public function lock($key, $token, $ttl = 10, $timeout = 3000)
+    {
+        $startTime = microtime(true) * 1000;
+        
+        while (true) {
+            // 原子操作：SET key value NX EX ttl
+            $result = $this->redis->set($key, $token, ['nx', 'ex' => $ttl]);
+            
+            if ($result) {
+                // 获取锁成功
+                return true;
+            }
+            
+            // 检查是否超时
+            $now = microtime(true) * 1000;
+            if ($now - $startTime > $timeout) {
+                // 超时，获取锁失败
+                Log::warning("获取锁超时", ['key' => $key, 'timeout' => $timeout]);
+                return false;
+            }
+            
+            // 等待50ms后重试
+            usleep(50000);
+        }
+    }
+    
+
+    
+    /**
+     * 释放锁（Lua脚本保证原子性）
+     * @param string $key
+     * @param string $token
+     * @return bool
+     */
+    public function unlock($key, $token)
+    {
+        $luaScript = <<<LUA
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            else
+                return 0
+            end
+LUA;
+        
+        $result = $this->redis->eval($luaScript, [$key, $token], 1);
+        return $result == 1;
+    }
+    
+    /**
+     * 自动续期（防止业务执行时间过长导致锁自动释放）
+     * 启动一个后台进程每3秒检查一次，如果锁还存在就续期
+     * 
+     * @param string $key
+     * @param string $token
+     * @param int $ttl
+     * @return \Swoole\Timer
+     */
+    public function renewLock($key, $token, $ttl = 10)
+    {
+        if (!extension_loaded('swoole')) {
+            Log::warning("Swoole未安装，无法自动续期"); //或者定时任务轮询快到期的锁数据（有一个redis锁表） 
+            return null;
+        }
+        
+        // 每3秒续期一次
+        $timerId = \Swoole\Timer::tick(3000, function() use ($key, $token, $ttl) {
+            $luaScript = <<<LUA
+                if redis.call('GET', KEYS[1]) == ARGV[1] then
+                    return redis.call('EXPIRE', KEYS[1], ARGV[2])
+                else
+                    return 0
+                end
+LUA;
+            $result = $this->redis->eval($luaScript, [$key, $token, $ttl], 1);
+            
+            if ($result == 0) {
+                // 锁已丢失，停止续期
+                return false;
+            }
+        });
+        
+        return $timerId;
+    }
+}
+
+
+3 使用分布式锁的下单代码
+
+<?php
+namespace app\controller;
+
+use app\service\RedisLock;
+use think\facade\Db;
+use think\facade\Log;
+use app\BaseController;
+
+class OrderWithDistributedLock extends BaseController
+{
+    private $lockService;
+    
+    public function __construct()
+    {
+        parent::__construct();
+        $this->lockService = new RedisLock();
+    }
+    
+    /**
+     * 下单（使用分布式锁）
+     */
+    public function placeOrder()
+    {
+        $goodsId = 1;
+        $buyNum = 1;
+        $userId = 1;
+        
+        // 1. 生成锁的唯一标识
+        $lockKey = "lock:stock:{$goodsId}";
+        $token = uniqid(mt_rand(), true);
+        $lockTTL = 10;  // 锁过期时间10秒
+        
+        // 2. 尝试获取锁（最多等待3秒）
+        $locked = $this->lockService->lock($lockKey, $token, $lockTTL, 3000);
+        
+        if (!$locked) {
+            return json([
+                'code' => 429,  // Too Many Requests
+                'msg' => '系统繁忙，请稍后重试'
+            ]);
+        }
+        
+        // 3. 可选：启动自动续期（如果业务可能超过10秒）
+        $timerId = $this->lockService->renewLock($lockKey, $token, $lockTTL);
+        
+        Db::startTrans();
+        
+        try {
+            // 4. 执行数据库操作（此时持有锁，其他请求等待）
+            $affected = Db::name('goods')
+                ->where('id', $goodsId)
+                ->where('stock', '>=', $buyNum)
+                ->update([
+                    'stock' => Db::raw('stock - ' . $buyNum),
+                    'update_time' => time()
+                ]);
+            
+            if ($affected === 0) {
+                throw new \Exception('库存不足');
+            }
+            
+            // 5. 创建订单（模拟业务耗时）
+            $orderId = Db::name('orders')->insertGetId([
+                'order_sn' => date('YmdHis') . mt_rand(10000, 99999),
+                'goods_id' => $goodsId,
+                'user_id' => $userId,
+                'num' => $buyNum,
+                'status' => 0,
+                'create_time' => time()
+            ]);
+            
+            // 模拟慢速业务（测试自动续期）
+            // sleep(12);  // 如果业务超过10秒，自动续期会保持锁
+            
+            Db::commit();
+            
+            return json([
+                'code' => 0,
+                'msg' => '下单成功',
+                'data' => ['order_id' => $orderId]
+            ]);
+            
+        } catch (\Exception $e) {
+            Db::rollback();
+            return json(['code' => 1, 'msg' => $e->getMessage()]);
+        } finally {
+            // 6. 释放锁
+            $this->lockService->unlock($lockKey, $token);
+            
+            // 7. 停止续期定时器
+            if ($timerId) {
+                \Swoole\Timer::clear($timerId);
+            }
+        }
+    }
+    
+    /**
+     * 红锁实现（Redis Cluster环境，确保强一致性）
+     * 需要同时获取半数以上Redis节点的锁才算成功
+     */
+    public function redLock()
+    {
+        // 配置多个独立的Redis实例
+        $redisNodes = [
+            ['host' => '127.0.0.1', 'port' => 6379, 'timeout' => 0.01],
+            ['host' => '127.0.0.1', 'port' => 6380, 'timeout' => 0.01],
+            ['host' => '127.0.0.1', 'port' => 6381, 'timeout' => 0.01],
+        ];
+        
+        $lockKey = "redlock:stock:1";
+        $token = uniqid(mt_rand(), true);
+        $ttl = 10000;  // 10秒（毫秒）
+        $quorum = ceil(count($redisNodes) / 2);  // 需要3个节点中的2个同意
+        
+        $startTime = microtime(true) * 1000;
+        $lockedCount = 0;
+        
+        foreach ($redisNodes as $node) {
+            try {
+                $redis = new \Redis();
+                $redis->connect($node['host'], $node['port'], $node['timeout']);
+                
+                // SET NX PX（PX单位是毫秒）
+                $result = $redis->set($lockKey, $token, ['nx', 'px' => $ttl]);
+                
+                if ($result) {
+                    $lockedCount++;
+                }
+            } catch (\Exception $e) {
+                // 节点连接失败，跳过
+                continue;
+            }
+        }
+        
+        // 计算获取锁消耗的时间
+        $elapsedTime = (microtime(true) * 1000) - $startTime;
+        
+        // 只有满足多数节点且消耗时间小于锁有效期，才算成功
+        if ($lockedCount >= $quorum && $elapsedTime < $ttl) {
+            // 成功获取锁
+            // 实际有效时间 = ttl - elapsedTime
+            $realTTL = $ttl - $elapsedTime;
+            
+            try {
+                // 执行业务逻辑...
+                return json(['code' => 0, 'msg' => '获取红锁成功']);
+            } finally {
+                // 释放所有节点的锁
+                foreach ($redisNodes as $node) {
+                    $redis = new \Redis();
+                    $redis->connect($node['host'], $node['port']);
+                    
+                    $luaScript = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end";
+                    $redis->eval($luaScript, [$lockKey, $token], 1);
+                }
+            }
+        } else {
+            // 获取锁失败，释放已获取的锁
+            return json(['code' => 1, 'msg' => '系统繁忙']);
+        }
+    }
+}
+
+
+
+
+4 分布式锁的常见问题和解决方案
+
+
+问题1：锁过期了业务还没执行完
+// 解决方案：自动续期（Watch Dog机制）
+// 上面代码中的 renewLock 方法已实现
+
+// 原理：启动一个守护线程，每1/3的TTL时间检查一次锁
+// 如果锁还在当前客户端手中，就执行EXPIRE续期
+
+
+
+问题2：释放了别人的锁
+
+// 错误示例：
+$redis->del($lockKey);  // ❌ 直接删除，可能删了别人的锁
+
+// 正确示例：先GET校验，再DEL
+$token = $redis->get($lockKey);
+if ($token === $myToken) {
+    $redis->del($lockKey);
+}
+
+
+
+
+问题3：Redis主从切换导致锁丢失
+
+场景：
+1. 客户端A在Master上获取锁成功
+2. Master宕机，数据还未同步到Slave
+3. Slave提升为Master
+4. 客户端B在新Master上也能获取到同一个锁
+5. 锁失效
+
+解决方案：使用RedLock算法（已在上面代码中实现）
+
+
+
+
+
+
+
+
+分布式锁的性能优化
+
+/**
+ * 分段锁优化（降低锁粒度）
+ * 场景：商品有1000件库存
+ * 普通锁：lock:stock:1（一个锁，串行处理）
+ * 分段锁：分成10个段，每个段100件
+ */
+class SegmentLock
+{
+    private $redis;
+    private $segmentCount = 10;  // 分成10个段
+    
+    public function __construct()
+    {
+        $this->redis = Cache::store('redis')->getRedis();
+    }
+    
+    /**
+     * 扣减库存（分段锁）
+     */
+    public function decrementStock($goodsId, $num)
+    {
+        // 1. 随机尝试扣减某个段
+        for ($i = 0; $i < $this->segmentCount; $i++) {
+            $segmentId = mt_rand(1, $this->segmentCount);
+            $segmentKey = "stock:{$goodsId}:segment:{$segmentId}";
+            $lockKey = "lock:{$segmentKey}";
+            $token = uniqid();
+            
+            // 尝试获取分段锁
+            if ($this->redis->set($lockKey, $token, ['nx', 'ex' => 3])) {
+                // 获取锁成功，检查该段库存
+                $segmentStock = $this->redis->get($segmentKey) ?: 100;
+                
+                if ($segmentStock >= $num) {
+                    // 扣减该段库存
+                    $newStock = $this->redis->decrby($segmentKey, $num);
+                    $this->unlock($lockKey, $token);
+                    return true;
+                }
+                
+                $this->unlock($lockKey, $token);
+            }
+        }
+        
+        return false;  // 所有段库存都不足
+    }
+}

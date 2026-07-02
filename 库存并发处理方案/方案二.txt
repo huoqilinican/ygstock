@@ -1,0 +1,291 @@
+悲观锁
+
+1 SELECT ... FOR UPDATE 原理
+
+
+-- 开启事务
+BEGIN;
+
+-- 加锁查询（排他锁）
+SELECT * FROM goods WHERE id = 1 FOR UPDATE;
+
+-- 业务逻辑...
+UPDATE goods SET stock = stock - 1 WHERE id = 1;
+
+-- 提交事务（释放锁）
+COMMIT;
+
+
+
+锁的工作机制：
+
+事务A                              事务B
+  |                                  |
+BEGIN;                              BEGIN;
+  |                                  |
+SELECT * FROM goods WHERE id=1       |
+FOR UPDATE (获得行锁X)                |
+  |                                  |
+  |                            SELECT * FROM goods WHERE id=1
+  |                            FOR UPDATE (等待...)
+  |                                  |
+UPDATE goods SET stock=stock-1       |
+  |                                  |
+COMMIT (释放锁)                       |
+  |                            (获得锁，继续执行)
+  |                            SELECT... (看到事务A提交后的结果)
+
+
+
+
+
+  2 完整的悲观锁实现（含复杂业务场景）
+
+  <?php
+namespace app\controller;
+
+use think\facade\Db;
+use think\facade\Cache;
+use app\BaseController;
+
+class OrderWithPessimisticLock extends BaseController
+{
+    /**
+     * 复杂下单场景（需要多表操作）
+     * 场景：下单时同时扣除库存、使用优惠券、扣除积分、锁定赠品
+     */
+    public function complexOrder()
+    {
+        $goodsId = 1;
+        $buyNum = 1;
+        $userId = 1;
+        $couponId = 100;  // 使用的优惠券ID
+        
+        // 开启事务
+        Db::startTrans();
+        
+        try {
+            // ========== 1. 锁定商品库存（FOR UPDATE） ==========
+            $goods = Db::name('goods')
+                ->where('id', $goodsId)
+                ->lock(true)  // 等同于 ->lock('FOR UPDATE')
+                ->find();
+            
+            if (!$goods) {
+                throw new \Exception('商品不存在');
+            }
+            if ($goods['stock'] < $buyNum) {
+                throw new \Exception('库存不足');
+            }
+            
+            // ========== 2. 锁定优惠券（防止被他人使用） ==========
+            $coupon = Db::name('coupon')
+                ->where('id', $couponId)
+                ->where('user_id', $userId)
+                ->where('status', 0)  // 0未使用
+                ->lock(true)
+                ->find();
+            
+            if (!$coupon) {
+                throw new \Exception('优惠券无效或已被使用');
+            }
+            if ($coupon['min_amount'] > $goods['price'] * $buyNum) {
+                throw new \Exception('未达到优惠券使用门槛');
+            }
+            
+            // ========== 3. 锁定用户积分（防止积分被并发扣减） ==========
+            $userPoints = Db::name('user_points')
+                ->where('user_id', $userId)
+                ->lock(true)
+                ->find();
+            
+            // 计算需要扣除的积分（假设每100积分抵扣1元）
+            $needPoints = 0;
+            if ($coupon['type'] == 'points_discount') {
+                $needPoints = $coupon['points_cost'];
+                if ($userPoints['points'] < $needPoints) {
+                    throw new \Exception('积分不足');
+                }
+            }
+            
+            // ========== 4. 锁定赠品库存（如果需要） ==========
+            $giftId = 10;
+            $gift = Db::name('gift')
+                ->where('id', $giftId)
+                ->where('stock', '>', 0)
+                ->lock(true)
+                ->find();
+            
+            if (!$gift) {
+                // 赠品不足不强制报错，可以不加赠品
+                $giftId = null;
+            }
+            
+            // ========== 5. 执行所有更新操作 ==========
+            
+            // 5.1 扣减商品库存
+            Db::name('goods')
+                ->where('id', $goodsId)
+                ->update([
+                    'stock' => $goods['stock'] - $buyNum,
+                    'sales' => Db::raw('sales + ' . $buyNum)
+                ]);
+            
+            // 5.2 使用优惠券（更新状态）
+            Db::name('coupon')
+                ->where('id', $couponId)
+                ->update([
+                    'status' => 1,  // 已使用
+                    'use_time' => time(),
+                    'order_id' => $orderId ?? 0
+                ]);
+            
+            // 5.3 扣除用户积分
+            if ($needPoints > 0) {
+                Db::name('user_points')
+                    ->where('user_id', $userId)
+                    ->update([
+                        'points' => $userPoints['points'] - $needPoints
+                    ]);
+            }
+            
+            // 5.4 扣减赠品库存
+            if ($giftId) {
+                Db::name('gift')
+                    ->where('id', $giftId)
+                    ->update([
+                        'stock' => Db::raw('stock - 1')
+                    ]);
+            }
+            
+            // 5.5 创建订单（包含优惠券和赠品信息）
+            $orderId = Db::name('orders')->insertGetId([
+                'order_sn' => $this->generateOrderSn(),
+                'goods_id' => $goodsId,
+                'user_id' => $userId,
+                'num' => $buyNum,
+                'amount' => $this->calculateAmount($goods['price'], $buyNum, $coupon),
+                'coupon_id' => $couponId,
+                'gift_id' => $giftId,
+                'used_points' => $needPoints,
+                'status' => 0,
+                'create_time' => time(),
+                'expire_time' => time() + 1800
+            ]);
+            
+            // ========== 6. 提交事务（释放所有锁） ==========
+            Db::commit();
+            
+            return json([
+                'code' => 0,
+                'msg' => '下单成功',
+                'data' => ['order_id' => $orderId]
+            ]);
+            
+        } catch (\Exception $e) {
+            Db::rollback();
+            return json(['code' => 1, 'msg' => $e->getMessage()]);
+        }
+    }
+    
+    private function calculateAmount($price, $num, $coupon)
+    {
+        $amount = $price * $num;
+        $amount -= $coupon['discount'];
+        $amount = max(0, $amount);
+        return $amount;
+    }
+    
+    private function generateOrderSn()
+    {
+        return date('YmdHis') . mt_rand(10000, 99999);
+    }
+}
+
+
+
+
+
+
+
+3 悲观锁的注意事项
+
+1. 事务要尽可能短
+
+// 错误示例：事务中包含大量无关操作
+Db::startTrans();
+$goods = Db::name('goods')->lock(true)->find();
+sleep(5);  // ❌ 千万不能有sleep
+sendEmail();  // ❌ 不要包含外部请求
+Log::write();  // ❌ 日志可以放在事务外
+Db::commit();
+
+// 正确示例：只把必要的数据库操作放在事务内
+$goods = Db::name('goods')->lock(true)->find();  // 加锁
+Db::startTrans();
+try {
+    // 只放数据库写操作
+    Db::name('goods')->update(...);
+    Db::name('orders')->insert(...);
+    Db::commit();
+} catch (\Exception $e) {
+    Db::rollback();
+}
+// 其他操作放在事务外
+
+
+
+
+
+2. 设置合理的锁等待超时
+
+-- 修改MySQL配置（my.cnf）
+innodb_lock_wait_timeout = 10  -- 锁等待超时10秒，避免长时间阻塞
+
+-- 或者程序里设置超时
+Db::execute("SET SESSION innodb_lock_wait_timeout = 5");
+
+
+
+
+3. 注意死锁问题
+
+// 可能产生死锁的代码
+// 事务A：先锁goods1，再锁goods2
+// 事务B：先锁goods2，再锁goods1
+
+// 解决方案：统一锁定顺序
+// 所有事务都按照goods_id从小到大锁定
+$goodsIds = [2, 1];
+sort($goodsIds);  // 排序后锁定顺序一致
+
+foreach ($goodsIds as $goodsId) {
+    $goods = Db::name('goods')->where('id', $goodsId)->lock(true)->find();
+}
+
+
+
+
+
+4 悲观锁适用场景
+
+适合：
+
+✅ 并发量不高（<500 TPS）
+
+✅ 业务逻辑复杂，需要操作多张表
+
+✅ 需要保证多个资源的一致性（库存+积分+优惠券+赠品）
+
+
+
+不适合：
+
+❌ 高并发场景（会大量阻塞）
+
+❌ 用户响应时间要求高（锁等待会超时）
+
+❌ 分布式部署（需要分布式锁）
+
+
+

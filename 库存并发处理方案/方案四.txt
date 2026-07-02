@@ -1,0 +1,524 @@
+Redis预减+消息队列
+1>架构设计
+用户请求（10万并发）
+        ↓
+   Nginx负载均衡
+        ↓
+   PHP-FPM集群
+        ↓
+   [Redis Lua原子扣减]  ← 第一道防线：快速拦截95%请求
+        ↓ (扣减成功)
+   立即返回"排队中"
+        ↓
+   写入消息队列（RabbitMQ/Redis List）
+        ↓
+   消费者进程（单线程串行处理）
+        ↓
+   数据库落库（只有真正成功的才会写入）
+        ↓
+   更新订单状态
+
+2>Redis Lua脚本详解
+-- 文件名: seckill.lua
+-- 功能：原子扣减秒杀库存
+-- KEYS[1]: 秒杀商品库存key
+-- KEYS[2]: 用户已抢购记录key（可选，防重复购买）
+-- ARGV[1]: 扣减数量
+-- ARGV[2]: 用户ID（用于防重复）
+-- ARGV[3]: 过期时间
+
+-- 1. 防重复购买检查
+if KEYS[2] then
+    local userBuyKey = KEYS[2]
+    local hasBought = redis.call('SISMEMBER', userBuyKey, ARGV[2])
+    if hasBought == 1 then
+        return -2  -- 用户已购买过
+    end
+end
+
+-- 2. 检查库存
+local stock = tonumber(redis.call('GET', KEYS[1]))
+if not stock or stock <= 0 then
+    return -1  -- 库存不足
+end
+
+-- 3. 扣减库存
+if stock >= tonumber(ARGV[1]) then
+    local newStock = redis.call('DECRBY', KEYS[1], ARGV[1])
+    
+    -- 4. 记录用户购买记录
+    if KEYS[2] then
+        redis.call('SADD', KEYS[2], ARGV[2])
+        redis.call('EXPIRE', KEYS[2], ARGV[3])
+    end
+    
+    return newStock  -- 返回剩余库存
+end
+
+return -1
+
+
+
+3> 完整的秒杀系统实现
+
+
+1.库存预热和同步
+
+<?php
+namespace app\command;
+
+use think\console\Command;
+use think\console\Input;
+use think\console\Output;
+use think\facade\Cache;
+use think\facade\Db;
+
+class SeckillPrepare extends Command
+{
+    protected function configure()
+    {
+        $this->setName('seckill:prepare')
+            ->setDescription('预热秒杀库存到Redis')
+            ->addArgument('goods_id')
+            ->addArgument('stock');
+    }
+    
+    protected function execute(Input $input, Output $output)
+    {
+        $goodsId = $input->getArgument('goods_id');
+        $stock = $input->getArgument('stock');
+        
+        $redis = Cache::store('redis')->getRedis();
+        
+        // 1. 设置库存
+        $stockKey = "seckill:stock:{$goodsId}";
+        $redis->set($stockKey, $stock);
+        
+        // 2. 清空用户记录（新的一轮秒杀）
+        $userKey = "seckill:user:{$goodsId}";
+        $redis->del($userKey);
+        
+        // 3. 设置活动信息
+        $infoKey = "seckill:info:{$goodsId}";
+        $redis->hMSet($infoKey, [
+            'start_time' => time() + 3600,  // 1小时后开始
+            'end_time' => time() + 7200,    // 2小时后结束
+            'init_stock' => $stock,
+            'status' => 1  // 待开始
+        ]);
+        
+        $output->writeln("秒杀预热成功: goods_id={$goodsId}, stock={$stock}");
+    }
+}
+
+/**
+ * 定时同步Redis库存到数据库（防止数据丢失）
+ */
+class SeckillSync extends Command
+{
+    protected function configure()
+    {
+        $this->setName('seckill:sync')
+            ->setDescription('同步Redis库存到数据库');
+    }
+    
+    protected function execute(Input $input, Output $output)
+    {
+        $redis = Cache::store('redis')->getRedis();
+        
+        // 获取所有秒杀商品的key
+        $keys = $redis->keys('seckill:stock:*');
+        
+        foreach ($keys as $key) {
+            preg_match('/seckill:stock:(\d+)/', $key, $matches);
+            $goodsId = $matches[1] ?? 0;
+            
+            if (!$goodsId) continue;
+            
+            $redisStock = $redis->get($key);
+            $dbStock = Db::name('goods')->where('id', $goodsId)->value('stock');
+            
+            if ($redisStock !== null && $redisStock != $dbStock) {
+                // 同步库存
+                Db::name('goods')
+                    ->where('id', $goodsId)
+                    ->update(['stock' => $redisStock]);
+                
+                $output->writeln("同步库存: goods_id={$goodsId}, stock={$redisStock}");
+            }
+        }
+        
+        $output->writeln("库存同步完成");
+    }
+}
+
+
+2.秒杀控制器入口
+<?php
+namespace app\controller;
+
+use think\facade\Cache;
+use think\facade\Db;
+use think\facade\Log;
+use think\facade\Queue;
+use think\facade\Validate;
+use app\BaseController;
+
+class SeckillController extends BaseController
+{
+    private $redis;
+    private $luaScriptSha;  // Lua脚本的SHA值（用于EVALSHA优化）
+    
+    public function __construct()
+    {
+        parent::__construct();
+        $this->redis = Cache::store('redis')->getRedis();
+        
+        // 加载Lua脚本并缓存SHA（减少网络传输）
+        $luaScript = $this->getLuaScript();
+        $this->luaScriptSha = $this->redis->script('load', $luaScript);
+    }
+    
+    /**
+     * 秒杀入口
+     */
+    public function seckill()
+    {
+        // 1. 参数校验
+        $params = $this->request->post();
+        $validate = Validate::rule([
+            'goods_id' => 'require|integer',
+            'num' => 'require|integer|between:1,5'  // 每人限购5件
+        ]);
+        
+        if (!$validate->check($params)) {
+            return json(['code' => 400, 'msg' => $validate->getError()]);
+        }
+        
+        $goodsId = $params['goods_id'];
+        $buyNum = $params['num'];
+        $userId = $this->getUserId();  // 从token获取用户ID
+        
+        // 2. 限流检查（令牌桶算法）
+        $limited = $this->checkRateLimit($userId);
+        if ($limited) {
+            return json(['code' => 429, 'msg' => '请求过于频繁，请稍后再试']);
+        }
+        
+        // 3. 执行Lua脚本（原子扣减）
+        $stockKey = "seckill:stock:{$goodsId}";
+        $userKey = "seckill:user:{$goodsId}";  // 记录已秒杀到的用户
+        $ttl = 3600;  // 记录保留1小时
+        
+        try {
+            // 方式1：使用EVALSHA（性能更好）
+            $result = $this->redis->evalSha($this->luaScriptSha, [
+                $stockKey, $userKey, $buyNum, $userId, $ttl
+            ], 2);  // 2表示有2个KEY参数
+            
+            // 方式2：如果EVALSHA失败，降级到EVAL
+            if ($result === false) {
+                $luaScript = $this->getLuaScript();
+                $result = $this->redis->eval($luaScript, [
+                    $stockKey, $userKey, $buyNum, $userId, $ttl
+                ], 2);
+            }
+            
+        } catch (\Exception $e) {
+            Log::error("Lua执行失败", ['error' => $e->getMessage()]);
+            return json(['code' => 500, 'msg' => '系统错误']);
+        }
+        
+        // 4. 处理Lua返回结果
+        if ($result === -1) {
+            return json(['code' => 1, 'msg' => '已抢光']);
+        }
+        
+        if ($result === -2) {
+            return json(['code' => 1, 'msg' => '您已经抢到过啦']);
+        }
+        
+        if ($result < 0) {
+            return json(['code' => 1, 'msg' => '秒杀失败']);
+        }
+        
+        // 5. Redis扣减成功，推送消息到队列
+        $queueData = [
+            'goods_id' => $goodsId,
+            'user_id' => $userId,
+            'num' => $buyNum,
+            'seckill_time' => time(),
+            'retry_count' => 0
+        ];
+        
+        // 推送到队列（支持延迟队列和优先级）
+        Queue::push('app\job\SeckillOrderJob', $queueData, 'seckill');
+        
+        // 6. 立即返回成功（排队中）
+        return json([
+            'code' => 0,
+            'msg' => '抢购成功，正在生成订单',
+            'data' => [
+                'queue_status' => 'pending',
+                'estimated_time' => 5  // 预计5秒内完成
+            ]
+        ]);
+    }
+    
+    /**
+     * 查询秒杀结果
+     */
+    public function queryResult()
+    {
+        $goodsId = $this->request->get('goods_id');
+        $userId = $this->getUserId();
+        
+        // 先查Redis缓存
+        $cacheKey = "seckill:result:{$goodsId}:{$userId}";
+        $result = Cache::get($cacheKey);
+        
+        if ($result) {
+            return json(json_decode($result, true));
+        }
+        
+        // 未命中缓存，查数据库
+        $order = Db::name('seckill_orders')
+            ->where('goods_id', $goodsId)
+            ->where('user_id', $userId)
+            ->find();
+        
+        if ($order) {
+            $data = [
+                'code' => 0,
+                'msg' => '抢购成功',
+                'data' => ['order_id' => $order['id']]
+            ];
+            Cache::set($cacheKey, json_encode($data), 300);  // 缓存5分钟
+            return json($data);
+        }
+        
+        return json(['code' => 1, 'msg' => '抢购失败或尚未处理完成']);
+    }
+    
+    /**
+     * 令牌桶限流
+     */
+    private function checkRateLimit($userId)
+    {
+        $key = "rate_limit:{$userId}";
+        $rate = 10;   // 每秒10个令牌
+        $capacity = 50;  // 桶容量50
+        
+        $now = microtime(true);
+        $tokens = $this->redis->get($key);
+        
+        if ($tokens === false) {
+            // 初始化桶
+            $this->redis->set($key, $capacity - 1);
+            $this->redis->expire($key, 1);
+            return false;
+        }
+        
+        $lastTime = $this->redis->get("{$key}:time") ?: $now;
+        $delta = $now - $lastTime;
+        $newTokens = min($capacity, $tokens + $delta * $rate);
+        
+        if ($newTokens < 1) {
+            return true;  // 被限流
+        }
+        
+        // 消耗一个令牌
+        $this->redis->set($key, $newTokens - 1);
+        $this->redis->set("{$key}:time", $now);
+        return false;
+    }
+    
+    private function getLuaScript()
+    {
+        return <<<LUA
+            local stockKey = KEYS[1]
+            local userKey = KEYS[2]
+            local buyNum = tonumber(ARGV[1])
+            local userId = ARGV[2]
+            local expireTime = tonumber(ARGV[3])
+            
+            -- 防重复检查
+            local isUserExists = redis.call('SISMEMBER', userKey, userId)
+            if isUserExists == 1 then
+                return -2
+            end
+            
+            -- 库存检查
+            local stock = tonumber(redis.call('GET', stockKey))
+            if not stock or stock <= 0 then
+                return -1
+            end
+            
+            if stock >= buyNum then
+                local newStock = redis.call('DECRBY', stockKey, buyNum)
+                redis.call('SADD', userKey, userId)
+                redis.call('EXPIRE', userKey, expireTime)
+                return newStock
+            end
+            
+            return -1
+LUA;
+    }
+    
+    private function getUserId()
+    {
+        // 实际从JWT token中获取
+        return $this->request->middleware('auth')->userId ?? 1;
+    }
+}
+
+
+
+3.队列消费者（处理落库），这里默认是用redis实现，也可以用rabbitmq方案（定时任务去执行队列任务的消费脚本）
+<?php
+namespace app\job;
+
+use think\facade\Db;
+use think\facade\Cache;
+use think\facade\Log;
+use think\queue\Job;
+
+class SeckillOrderJob
+{
+    /**
+     * 处理秒杀订单
+     */
+    public function fire(Job $job, $data)
+    {
+        $goodsId = $data['goods_id'];
+        $userId = $data['user_id'];
+        $buyNum = $data['num'];
+        $retryCount = $data['retry_count'] ?? 0;
+        
+        Log::info("处理秒杀订单", ['data' => $data]);
+        
+        // 幂等性检查（防止重复消费）
+        $idempotentKey = "idempotent:seckill:{$goodsId}:{$userId}";
+        $processed = Cache::get($idempotentKey);
+        
+        if ($processed) {
+            Log::warning("重复消费", ['data' => $data]);
+            $job->delete();
+            return;
+        }
+        
+        Db::startTrans();
+        
+        try {
+            // 1. 再次校验数据库库存（二次确认）
+            $affected = Db::name('goods')
+                ->where('id', $goodsId)
+                ->where('stock', '>=', $buyNum)
+                ->update([
+                    'stock' => Db::raw('stock - ' . $buyNum),
+                    'sales' => Db::raw('sales + ' . $buyNum)
+                ]);
+            
+            if ($affected === 0) {
+                throw new \Exception('数据库库存不足');
+            }
+            
+            // 2. 创建订单
+            $orderId = Db::name('seckill_orders')->insertGetId([
+                'order_sn' => $this->generateOrderSn(),
+                'goods_id' => $goodsId,
+                'user_id' => $userId,
+                'num' => $buyNum,
+                'status' => 0,  // 待支付
+                'seckill_time' => $data['seckill_time'],
+                'create_time' => time()
+            ]);
+            
+            // 3. 标记幂等
+            Cache::set($idempotentKey, $orderId, 86400);  // 24小时有效期
+            
+            // 4. 更新Redis中的用户订单信息
+            $userOrderKey = "seckill:order:{$goodsId}:{$userId}";
+            Cache::set($userOrderKey, $orderId, 3600);
+            
+            Db::commit();
+            
+            // 5. 发送通知（异步，不影响主流程）
+            $this->sendNotification($userId, $orderId);
+            
+            // 6. 删除队列任务
+            $job->delete();
+            
+            Log::info("秒杀订单创建成功", ['order_id' => $orderId]);
+            
+        } catch (\Exception $e) {
+            Db::rollback();
+            
+            Log::error("秒杀订单创建失败", [
+                'error' => $e->getMessage(),
+                'data' => $data,
+                'retry_count' => $retryCount
+            ]);
+            
+            // 重试逻辑（最多3次）
+            if ($retryCount < 3) {
+                $data['retry_count'] = $retryCount + 1;
+                $job->release(5);  // 5秒后重试
+            } else {
+                // 超过重试次数，记录到失败队列
+                $this->handleFailedJob($data, $e->getMessage());
+                $job->delete();
+            }
+        }
+    }
+    
+    /**
+     * 处理失败的任务
+     */
+    private function handleFailedJob($data, $errorMsg)
+    {
+        Db::name('failed_jobs')->insert([
+            'queue' => 'seckill',
+            'payload' => json_encode($data),
+            'exception' => $errorMsg,
+            'failed_at' => time()
+        ]);
+        
+        // 回滚Redis库存
+        $redis = Cache::store('redis')->getRedis();
+        $stockKey = "seckill:stock:{$data['goods_id']}";
+        $userKey = "seckill:user:{$data['goods_id']}";
+        $redis->incrby($stockKey, $data['num']);
+        $redis->srem($userKey, $data['user_id']);
+        
+        // 发送告警
+        $this->sendAlert($data, $errorMsg);
+    }
+    
+    private function generateOrderSn()
+    {
+        return 'SK' . date('YmdHis') . mt_rand(10000, 99999);
+    }
+    
+    private function sendNotification($userId, $orderId)
+    {
+        // 推送到消息队列，由另一个消费者发送短信/推送
+        Queue::push('app\job\SendNotificationJob', [
+            'user_id' => $userId,
+            'order_id' => $orderId,
+            'type' => 'seckill_success'
+        ]);
+    }
+    
+    private function sendAlert($data, $errorMsg)
+    {
+        // 发送告警到钉钉/企业微信
+        $webhook = "https://oapi.dingtalk.com/robot/send";
+        $message = "秒杀订单失败告警\n商品ID: {$data['goods_id']}\n用户ID: {$data['user_id']}\n错误: {$errorMsg}";
+        // 发送HTTP请求...
+    }
+}
+
+
+
+

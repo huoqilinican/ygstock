@@ -1,0 +1,37 @@
+1. 使用管道批量操作
+
+// 批量查询库存
+$redis->multi();  // 开启管道
+for ($i = 1; $i <= 100; $i++) {
+    $redis->get("seckill:stock:{$i}");
+}
+$results = $redis->exec();  // 一次性获取所有结果
+
+
+2. 使用连接池
+
+// 配置thinkphp的redis连接池
+// config/cache.php
+return [
+    'default' => 'redis',
+    'stores' => [
+        'redis' => [
+            'type' => 'redis',
+            'host' => '127.0.0.1',
+            'port' => 6379,
+            'password' => '',
+            'select' => 0,
+            'timeout' => 0,
+            'expire' => 0,
+            'persistent' => true,
+            'userername' => '',
+            'pool' => [
+                'max_connections' => 50,   // 最大连接数
+                'min_connections' => 10,   // 最小连接数
+                'wait_timeout' => 3,       // 获取连接超时时间
+                'idle_timeout' => 60,      // 空闲连接超时
+            ]
+        ]
+    ]
+];
+
