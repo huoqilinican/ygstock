@@ -14,6 +14,7 @@ class CryptoService
     private static $publicKey;
 
     private static $serverPublicKey = null;   // 服务端公钥
+    private static $serverPrivateKey = null;   // 服务端私钥
     private static $clientPrivateKey = null;  // 客户端私钥
     private static $clientPublicKey = null;   // 客户端公钥（用于发给服务端）
 
@@ -49,6 +50,44 @@ class CryptoService
             }
         }
         return self::$serverPublicKey;
+    }
+
+    /**
+     * @return false|resource|null
+     * @throws \Exception
+     * @author foxme
+     * @date 2026/7/2 20:18
+     * Description: 获取服务端私钥
+     */
+    public static function getServerPrivateKey()
+    {
+        if (self::$serverPrivateKey === null) {
+            try {
+                $path = Config::get('rpc.server_private_key_path');
+                if (!file_exists($path)) {
+                    throw new \Exception("服务端私钥文件不存在: {$path}");
+                }
+
+                $content = file_get_contents($path);
+                $content = trim($content);
+
+                if (empty($content)) {
+                    throw new \Exception("服务端私钥文件内容为空");
+                }
+
+                self::$serverPrivateKey = openssl_pkey_get_private($content);
+                if (self::$serverPrivateKey === false) {
+                    throw new \Exception('服务端私钥无效: ' . openssl_error_string());
+                }
+
+                Log::info("服务端私钥加载成功");
+
+            } catch (\Exception $e) {
+                Log::error("加载服务端私钥失败: " . $e->getMessage());
+                throw $e;
+            }
+        }
+        return self::$serverPrivateKey;
     }
 
     /**
